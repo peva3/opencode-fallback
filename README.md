@@ -1,12 +1,15 @@
 # opencode-fallback
 
-OpenCode plugin that automatically recovers from provider disconnects (resuming mid-response) and rate limits (switching to a fallback model). Also includes an optional auto-continue loop mode.
+OpenCode 2 plugin that automatically recovers from provider disconnects (resuming mid-response) and rate limits (switching to a fallback model). Also includes an optional auto-continue loop mode.
+
+> **OpenCode 2 only.** Version 2.x targets the OpenCode 2 plugin API (`@opencode/plugin`).
+> For OpenCode 1, use version 1.x of this package.
 
 ## Features
 
 - **Disconnect Recovery**: Detects when a provider drops the connection mid-response, captures partial output, and sends a continuation prompt so the model picks up exactly where it left off.
 - **Rate Limit Fallback**: Detects rate-limit/quota errors and seamlessly re-sends the original request using a configurable fallback model.
-- **Auto-Continue Loop** ("Ralph Loop"): Activate per-session autonomous looping that sends a configurable nudge prompt every time the session goes idle, keeping the model working continuously.
+- **Auto-Continue Loop** ("Ralph Loop"): Activate per-session autonomous looping that sends a configurable nudge prompt every time the session finishes a turn, keeping the model working continuously.
 
 ## Installation
 
@@ -14,7 +17,35 @@ Add to your `opencode.jsonc`:
 
 ```json
 {
-  "plugin": ["opencode-fallback"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-fallback"]
+}
+```
+
+You can also pass configuration directly from the OpenCode config, which takes
+precedence over `fallback.json` (see [Configuration](#configuration)):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-fallback",
+      "options": {
+        "fallbackModel": "opencode/qwen3.6-plus-free",
+        "logging": true
+      }
+    }
+  ]
+}
+```
+
+Local directories are supported too (the path must point at the plugin
+directory, not an individual file):
+
+```json
+{
+  "plugins": ["/absolute/path/to/opencode-fallback"]
 }
 ```
 
@@ -98,6 +129,10 @@ Legacy `rate-limit-fallback.json` filenames are also supported in all the same l
 | `loopStopPhrase` | string | `"Ralph loop mode disabled"` | Phrase in a user message that deactivates the loop for that session |
 | `loopPrompt` | string | `"Continue working on the task."` | Prompt text sent to keep the model working each loop iteration |
 
+Every one of these can also be supplied through the `options` object of the
+`plugins` entry in `opencode.json(c)`; the OpenCode config wins over
+`fallback.json` when both define the same key.
+
 ### Fallback Model Format
 
 The `fallbackModel` field accepts a `"provider/model"` string:
@@ -118,6 +153,9 @@ Or an explicit object:
   }
 }
 ```
+
+> A bare model name with no `/` is treated as `providerID == modelID`. Always
+> include the provider prefix if the provider ID differs from the model ID.
 
 ### Continuation Prompt Template
 
@@ -145,6 +183,10 @@ The two pattern sets use different matching strategies:
 - **Rate-limit patterns** use case-insensitive **substring** matching (safe for multi-word phrases like "rate limit").
 - **Disconnect patterns** use case-insensitive **word-boundary** regex matching (`\b...\b`), preventing false positives like "eof" matching inside "thereof" or "502" matching inside longer numbers.
 
+Patterns are matched against the structured provider error exposed by the V2
+`retry` hook (error type, message, HTTP status and response body), not against a
+UI message.
+
 ### Logging
 
 When `logging: true`, logs are written to:
@@ -157,13 +199,22 @@ Log entries include timestamps and structured details about detection events, re
 
 ## How It Works
 
+OpenCode 2 does not publish `session.status` events to plugins, so detection uses
+the V2 `session.hook("retry", ...)` hook. The hook fires right before OpenCode
+retries a failed request and exposes the classified error (`type`, `message`,
+optional `status` and `response.body`).
+
+When a pattern matches, the plugin sets `decision = { retry: false }` to take
+over from OpenCode's built-in retry policy and schedules a recovery a moment
+later, so the failing run can settle.
+
 ### Disconnect Recovery
 
-1. **Detection**: Listens for `session.status` retry events whose message matches a disconnect pattern.
-2. **Abort**: Stops the current retry loop.
-3. **Capture**: Fetches messages and extracts text from the last (interrupted) assistant response.
-4. **Revert**: Reverts the session to the last user message, removing the incomplete assistant response.
-5. **Continue**: Sends a continuation prompt that includes the partial content, instructing the model to pick up exactly where it left off.
+1. **Detection**: `retry` hook error matches a disconnect pattern.
+2. **Take over**: Disable OpenCode's own retry for this attempt.
+3. **Abort**: Interrupt the current run.
+4. **Capture**: Fetch messages and extract text from the last (interrupted) assistant response.
+5. **Continue**: Send a continuation prompt that includes the partial content, instructing the model to pick up exactly where it left off.
 6. **Model selection**: First attempt retries with the same model (it was a disconnect, not a model issue). Subsequent attempts escalate to the fallback model.
 7. **Backoff**: Exponential delay between attempts (2s, 4s, 8s, up to 30s).
 8. **Guard**: Stops after `maxResumeAttempts` consecutive failures.
@@ -172,47 +223,77 @@ If no partial content was captured (e.g., the response hadn't started), the orig
 
 ### Rate Limit Fallback
 
-1. **Detection**: Listens for retry events whose message matches a rate-limit pattern.
-2. **Abort**: Stops the retry loop.
-3. **Revert**: Reverts the session to the last user message.
-4. **Re-send**: Sends the original user message with the configured fallback model.
+1. **Detection**: `retry` hook error matches a rate-limit pattern.
+2. **Take over**: Disable OpenCode's own retry for this attempt.
+3. **Abort**: Interrupt the current run.
+4. **Re-send**: Switch the session to the configured fallback model and re-send the original user message.
 5. **Cooldown**: Starts a cooldown timer (default 5 minutes). During cooldown, subsequent rate limits on the same session are ignored to prevent re-trigger spam.
-
-The conversation history stays clean -- no duplicate messages or "continue" artifacts.
 
 ### Auto-Continue Loop
 
 The loop feature is activated per-session using a magic phrase in any user message.
 
 1. Include your configured start phrase (default: `"Ralph loop mode enabled"`) in any message to activate the loop for that session.
-2. Once active, every time the session goes idle, the plugin automatically sends the configured loop prompt (default: `"Continue working on the task."`).
+2. Once active, every time a turn completes successfully, the plugin automatically sends the configured loop prompt (default: `"Continue working on the task."`).
 3. Include the stop phrase (default: `"Ralph loop mode disabled"`) to deactivate.
 
 Notes:
 - Stop takes priority over start if both phrases appear in the same message.
-- The activation message itself does not trigger a loop iteration (the loop starts on the *next* idle event).
-- The loop integrates with disconnect/rate-limit recovery: recovery runs first, and the loop resumes on the next idle.
+- The activation message itself does not trigger a loop iteration (the loop starts on the *next* completed turn).
+- The loop integrates with disconnect/rate-limit recovery: recovery runs first, and the loop resumes on the next completed turn.
+- Only successfully completed turns continue the loop; a failed turn stops it instead of spinning on a broken provider.
+
+## OpenCode 2 Differences
+
+The V2 plugin API differs from V1 in ways that affect this plugin's behavior:
+
+- **Detection via `retry` hook.** V2 does not deliver `session.status` events
+  (busy/retry/idle) to plugins, so detection moved from the event stream to the
+  `retry` hook. This gives structured provider errors instead of parsed strings.
+- **No `revert`.** The V2 plugin API has no `session.revert`, so the failed
+  assistant turn cannot be removed. Recovery appends a new message after the
+  failed attempt; the transcript therefore keeps the incomplete/erroring turn.
+- **Fallback model is session-scoped.** V2 prompts do not accept a model, so the
+  plugin uses `session.switchModel` before re-sending. The session stays on the
+  fallback model until you switch it back manually or start a new session.
+  (V1 scoped the fallback model to a single re-sent message.)
+- **"Idle" is inferred from `session.execution.succeeded`.** The loop only
+  advances on successfully completed turns.
+- **Plugins load per location.** Hooks and events are broadcast to every loaded
+  plugin instance, so only the instance that owns the session's location
+  performs a recovery. This prevents one failure from triggering one recovery
+  per location.
 
 ## Race Condition Handling
 
-The plugin uses a timestamp-based grace window to avoid re-triggering on stale retry events that were queued before a plugin-initiated abort took effect. Any retry event arriving within 5 seconds of the last plugin abort is ignored.
+The plugin uses a timestamp-based grace window to avoid re-triggering on retry
+events that belong to the attempt it is already recovering. Any retry event
+arriving within 5 seconds of the last plugin takeover is ignored.
 
 ## Backwards Compatibility
 
 - The legacy config filename `rate-limit-fallback.json` is still recognized.
 - The legacy `patterns` field in the config file maps to `rateLimitPatterns`.
 - The old type export `RateLimitFallbackConfig` is preserved as an alias for `FallbackConfig`.
+- Version 2.x requires OpenCode 2. Version 1.x remains available for OpenCode 1.
 
 ## Local Development
 
-For local development, use a `file://` URL in your config:
+Point the config at the plugin **directory** (a file path is rejected by the
+OpenCode 2 plugin loader):
 
 ```json
 {
-  "plugin": [
-    "file:///path/to/opencode-fallback/index.ts"
-  ]
+  "plugins": ["/absolute/path/to/opencode-fallback"]
 }
+```
+
+Then typecheck and reload:
+
+```sh
+npm install
+npm run typecheck
+opencode api post /api/location/reload
 ```
 
 ## License

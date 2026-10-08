@@ -213,6 +213,23 @@ export interface LoadConfigResult {
   createdDefaultConfig: string | null  // path if a new config file was created
 }
 
+/**
+ * Overlays plugin options from opencode.json(c) on top of the file config.
+ * Unknown keys are ignored so a mistyped option cannot break the plugin.
+ */
+export function applyOverrides(
+  config: FallbackConfig,
+  overrides: Record<string, unknown>
+): FallbackConfig {
+  const result = { ...config } as FallbackConfig & Record<string, unknown>
+  for (const [key, value] of Object.entries(overrides)) {
+    if (key in config && value !== undefined) {
+      result[key] = value
+    }
+  }
+  return result
+}
+
 export function loadConfig(): LoadConfigResult {
   const configPath = findConfigFile()
 

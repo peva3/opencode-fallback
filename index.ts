@@ -1,6 +1,6 @@
-// Only export the plugin function - OpenCode calls ALL exports as plugins
-// WARNING: Only ONE named function export is allowed. OpenCode calls every export as a plugin.
-export { createPlugin as FallbackPlugin } from "./src/plugin"
+// OpenCode 2 entrypoint: the default export must be a plugin definition with
+// an `id` and a `setup` (or `effect`) function.
+export { plugin as default, plugin as FallbackPlugin } from "./src/plugin"
 
 // Type exports are fine (stripped at runtime)
 export type {
@@ -9,6 +9,3 @@ export type {
   FallbackModel,
   FallbackModelObject,
 } from "./src/config"
-
-import { createPlugin } from "./src/plugin"
-export default createPlugin
