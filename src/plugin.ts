@@ -1,8 +1,24 @@
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import { loadConfig, parseModel, type FallbackModelObject } from "./config"
+import { resolve } from "node:path"
+import { Plugin } from "@opencode/plugin"
+import { applyOverrides, loadConfig, parseModel } from "./config"
 import { createLogger } from "./log"
 
+type Context = Plugin.Context
+
 // ── Types ────────────────────────────────────────────────────────────────────
+
+type SessionInfo = Awaited<ReturnType<Context["session"]["get"]>>
+type SessionMessages = Awaited<ReturnType<Context["session"]["context"]>>
+type SessionMessage = SessionMessages[number]
+type UserMessage = Extract<SessionMessage, { type: "user" }>
+type AssistantMessage = Extract<SessionMessage, { type: "assistant" }>
+type AssistantContent = AssistantMessage["content"][number]
+type ModelRef = NonNullable<SessionInfo["model"]>
+
+type EventSource = ReturnType<Context["event"]["subscribe"]>
+type PluginEvent = EventSource extends AsyncIterable<infer T> ? T : never
+
+type RetryKind = "rate-limit" | "disconnect"
 
 interface SessionState {
   // Rate limit fallback state
@@ -12,40 +28,26 @@ interface SessionState {
   // Disconnect resume state
   resumeAttempts: number
   resumeActive: boolean
-  originalModel: FallbackModelObject | null
-  // Timestamp (Date.now()) of the last plugin-initiated abort.
-  // Retry events whose `next` timestamp predates this are stale and ignored.
+  originalModel: ModelRef | null
+  // Timestamp (Date.now()) of the moment the plugin took over a retry.
+  // Retry events closer than the grace window belong to the attempt we are
+  // already recovering and are ignored.
   pluginAbortedAt: number
 
   // Ralph loop state
   loopActive: boolean
 }
 
-interface MessageInfo {
-  id: string
-  role: "user" | "assistant"
-  sessionID: string
-  model?: {
-    providerID: string
-    modelID: string
-  }
-  agent?: string
-}
+// ── Tuning ───────────────────────────────────────────────────────────────────
 
-interface MessagePart {
-  id: string
-  type: string
-  text?: string
-  mime?: string
-  filename?: string
-  url?: string
-  name?: string
-}
-
-interface MessageWithParts {
-  info: MessageInfo
-  parts: MessagePart[]
-}
+/** Ignore retry events arriving within this window after we took over. */
+const ABORT_GRACE_MS = 5000
+/** Let the failed run settle before interrupting and re-prompting. */
+const RECOVERY_DELAY_MS = 300
+/** Pause between the interrupt and reading the session context. */
+const INTERRUPT_SETTLE_MS = 200
+/** Cap on how much provider error payload is used for pattern matching. */
+const MAX_ERROR_TEXT = 4000
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -72,6 +74,26 @@ function getSessionState(sessionID: string): SessionState {
   return state
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function truncate(text: string, max = 200): string {
+  return text.length > max ? text.slice(0, max) + "..." : text
+}
+
+function isUserMessage(message: SessionMessage): message is UserMessage {
+  return message.type === "user"
+}
+
+function isAssistantMessage(message: SessionMessage): message is AssistantMessage {
+  return message.type === "assistant"
+}
+
+function isTextContent(content: AssistantContent): content is Extract<AssistantContent, { type: "text" }> {
+  return content.type === "text"
+}
+
 /**
  * Creates a case-insensitive substring matcher (suitable for multi-word phrases
  * like "rate limit" that don't need word-boundary protection).
@@ -79,7 +101,7 @@ function getSessionState(sessionID: string): SessionState {
 function createSubstringMatcher(patterns: string[]) {
   return (message: string): boolean => {
     const lower = message.toLowerCase()
-    return patterns.some(pattern => lower.includes(pattern.toLowerCase()))
+    return patterns.some((pattern) => lower.includes(pattern.toLowerCase()))
   }
 }
 
@@ -90,13 +112,13 @@ function createSubstringMatcher(patterns: string[]) {
  * status codes (pure digits) are matched with \b on both sides.
  */
 function createWordBoundaryMatcher(patterns: string[]) {
-  const regexes = patterns.map(pattern => {
+  const regexes = patterns.map((pattern) => {
     // Escape regex special characters in the pattern
     const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
     return new RegExp(`\\b${escaped}\\b`, "i")
   })
   return (message: string): boolean => {
-    return regexes.some(regex => regex.test(message))
+    return regexes.some((regex) => regex.test(message))
   }
 }
 
@@ -104,10 +126,8 @@ function createWordBoundaryMatcher(patterns: string[]) {
  * Extract all text content from an assistant message's parts.
  * Returns the concatenated text, or null if no text was found.
  */
-function extractPartialContent(message: MessageWithParts): string | null {
-  const textParts = message.parts
-    .filter(p => p.type === "text" && p.text)
-    .map(p => p.text!)
+function extractPartialContent(message: AssistantMessage): string | null {
+  const textParts = message.content.filter(isTextContent).map((part) => part.text)
 
   if (textParts.length === 0) return null
 
@@ -130,484 +150,580 @@ function buildContinuationPrompt(template: string, partialContent: string, maxLe
   return template.replace("{{partial_content}}", content)
 }
 
+/**
+ * Rebuild the prompt attachments of a stored user message.
+ * Inline attachments are re-emitted as data URIs so they can be re-sent.
+ */
+function toPromptFiles(files: UserMessage["files"]) {
+  if (!files || files.length === 0) return undefined
+  return files.map((file) => ({
+    uri: file.source.type === "uri" ? file.source.uri : `data:${file.mime};base64,${file.data}`,
+    name: file.name,
+    description: file.description,
+    mention: file.mention,
+  }))
+}
+
+/**
+ * V1 re-sent the original user message after reverting the session. V2 does not
+ * expose `revert` to plugins, so the same request is re-sent as a new message.
+ */
+function toPromptPayload(message: UserMessage) {
+  return {
+    text: message.text,
+    files: toPromptFiles(message.files),
+    agents: message.agents?.map((agent) => ({ name: agent.name, mention: agent.mention })),
+    skills: message.skills?.map((skill) => ({ id: skill.id, mention: skill.mention })),
+  }
+}
+
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
-export async function createPlugin(context: PluginInput): Promise<Hooks> {
-  const { config, createdDefaultConfig } = loadConfig()
-  const logger = createLogger(config.logging)
+export const plugin = Plugin.define({
+  id: "opencode-fallback",
+  async setup(ctx) {
+    const loaded = loadConfig()
+    // Plugin options from opencode.json(c) win over fallback.json.
+    const config = applyOverrides(loaded.config, ctx.options)
+    const logger = createLogger(config.logging)
 
-  if (createdDefaultConfig) {
-    await logger.info("Created default config file on first run", {
-      path: createdDefaultConfig,
-    })
-  }
-
-  const isRateLimitMessage = createSubstringMatcher(config.rateLimitPatterns)
-  const isDisconnectMessage = createWordBoundaryMatcher(config.disconnectPatterns)
-  const fallbackModel = parseModel(config.fallbackModel)
-
-  await logger.info("Plugin initialized", {
-    enabled: config.enabled,
-    fallbackModel: config.fallbackModel,
-    rateLimitPatterns: config.rateLimitPatterns,
-    disconnectPatterns: config.disconnectPatterns,
-    resumeWithSameModel: config.resumeWithSameModel,
-    maxResumeAttempts: config.maxResumeAttempts,
-    cooldownMs: config.cooldownMs,
-    loopEnabled: config.loopEnabled,
-    loopStartPhrase: config.loopStartPhrase,
-    loopStopPhrase: config.loopStopPhrase,
-  })
-
-  if (!config.enabled) {
-    await logger.info("Plugin disabled via config")
-    return {}
-  }
-
-  // ── Rate Limit Recovery ──────────────────────────────────────────────────
-  // Original behavior: abort, revert to last user message, re-send with fallback model.
-
-  async function handleRateLimitRecovery(sessionID: string, retryMessage: string) {
-    const state = getSessionState(sessionID)
-
-    if (state.fallbackActive && Date.now() < state.cooldownEndTime) {
-      await logger.info("Skipping rate-limit fallback, cooldown active", {
-        sessionID,
-        cooldownRemaining: state.cooldownEndTime - Date.now(),
+    if (loaded.createdDefaultConfig) {
+      await logger.info("Created default config file on first run", {
+        path: loaded.createdDefaultConfig,
       })
-      return
     }
 
-    await logger.info("Rate limit detected, switching to fallback model", {
-      sessionID,
-      message: retryMessage,
+    const isRateLimitMessage = createSubstringMatcher(config.rateLimitPatterns)
+    const isDisconnectMessage = createWordBoundaryMatcher(config.disconnectPatterns)
+    const fallbackModel = parseModel(config.fallbackModel)
+
+    await logger.info("Plugin initialized", {
+      enabled: config.enabled,
       fallbackModel: config.fallbackModel,
+      location: String(ctx.location.directory),
+      options: ctx.options,
+      rateLimitPatterns: config.rateLimitPatterns,
+      disconnectPatterns: config.disconnectPatterns,
+      resumeWithSameModel: config.resumeWithSameModel,
+      maxResumeAttempts: config.maxResumeAttempts,
+      cooldownMs: config.cooldownMs,
+      loopEnabled: config.loopEnabled,
+      loopStartPhrase: config.loopStartPhrase,
+      loopStopPhrase: config.loopStopPhrase,
     })
 
-    state.fallbackActive = true
-    state.cooldownEndTime = Date.now() + config.cooldownMs
-    state.pluginAbortedAt = Date.now()
-
-    try {
-      await logger.info("Aborting session", { sessionID })
-      await context.client.session.abort({ path: { id: sessionID } })
-      await new Promise(resolve => setTimeout(resolve, 200))
-
-      await logger.info("Fetching messages", { sessionID })
-      const messagesResponse = await context.client.session.messages({ path: { id: sessionID } })
-      const messages = messagesResponse.data as MessageWithParts[] | undefined
-
-      if (!messages || messages.length === 0) {
-        await logger.error("No messages found in session", { sessionID })
-        return
-      }
-
-      const lastUserMessage = [...messages].reverse().find(m => m.info.role === "user")
-      if (!lastUserMessage) {
-        await logger.error("No user message found in session", { sessionID })
-        return
-      }
-
-      await logger.info("Reverting to last user message", {
-        sessionID,
-        messageId: lastUserMessage.info.id,
-        totalMessages: messages.length,
-      })
-      await context.client.session.revert({
-        path: { id: sessionID },
-        body: { messageID: lastUserMessage.info.id },
-      })
-      await new Promise(resolve => setTimeout(resolve, 500))
-
-      const originalParts = lastUserMessage.parts
-        .filter(p => !isSyntheticPart(p))
-        .map(p => convertToPromptPart(p))
-        .filter((p): p is NonNullable<typeof p> => p !== null)
-
-      if (originalParts.length === 0) {
-        await logger.error("No valid parts found in user message", { sessionID })
-        return
-      }
-
-      await logger.info("Sending prompt with fallback model", {
-        sessionID,
-        model: fallbackModel,
-        partsCount: originalParts.length,
-      })
-      await context.client.session.prompt({
-        path: { id: sessionID },
-        body: {
-          model: fallbackModel,
-          agent: lastUserMessage.info.agent,
-          parts: originalParts,
-        },
-      })
-
-      await logger.info("Rate-limit fallback prompt sent successfully", { sessionID })
-    } catch (err) {
-      await logger.error("Failed to send rate-limit fallback prompt", {
-        sessionID,
-        error: err instanceof Error ? err.message : String(err),
-      })
-    }
-  }
-
-  // ── Disconnect Resume Recovery ───────────────────────────────────────────
-  // New behavior: capture partial assistant response, then send a continuation
-  // prompt that includes the partial content so the model picks up where it
-  // left off.
-
-  async function handleDisconnectRecovery(sessionID: string, retryMessage: string) {
-    const state = getSessionState(sessionID)
-
-    // Guard: max resume attempts
-    if (state.resumeAttempts >= config.maxResumeAttempts) {
-      await logger.warn("Max resume attempts reached, giving up", {
-        sessionID,
-        attempts: state.resumeAttempts,
-        maxAttempts: config.maxResumeAttempts,
-      })
+    if (!config.enabled) {
+      await logger.info("Plugin disabled via config")
       return
     }
 
-    // Guard: if we're already actively resuming, don't stack
-    if (state.resumeActive) {
-      await logger.info("Resume already in progress, skipping", { sessionID })
-      return
+    // ── Location guard ─────────────────────────────────────────────────────
+    // Plugin instances are loaded per location and hooks/events are broadcast
+    // to all of them. Recoveries must only run in the instance that owns the
+    // session, otherwise one failure would trigger one recovery per location.
+
+    async function isOwnSession(sessionID: string): Promise<boolean> {
+      try {
+        const info = await ctx.session.get({ sessionID })
+        const own = resolve(String(ctx.location.directory))
+        const theirs = info.location?.directory ? resolve(String(info.location.directory)) : own
+        return own === theirs
+      } catch (err) {
+        await logger.info("Could not resolve session location", {
+          sessionID,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return false
+      }
     }
 
-    await logger.info("Disconnect detected, attempting to resume", {
-      sessionID,
-      message: retryMessage,
-      attempt: state.resumeAttempts + 1,
-      maxAttempts: config.maxResumeAttempts,
-    })
+    // ── Rate Limit Recovery ────────────────────────────────────────────────
+    // OpenCode's own retry loop for the rate-limited model has been disabled
+    // (decision = no retry). Move the session to the fallback model and re-send
+    // the original request.
 
-    state.resumeActive = true
-    state.resumeAttempts += 1
-    state.pluginAbortedAt = Date.now()
+    async function handleRateLimitRecovery(sessionID: string, retryMessage: string) {
+      const state = getSessionState(sessionID)
 
-    try {
-      // Exponential backoff: 2s, 4s, 8s for attempts 1, 2, 3
-      const backoffMs = Math.min(2000 * Math.pow(2, state.resumeAttempts - 1), 30000)
-      if (state.resumeAttempts > 1) {
-        await logger.info("Applying exponential backoff before retry", {
+      if (state.fallbackActive && Date.now() < state.cooldownEndTime) {
+        await logger.info("Skipping rate-limit fallback, cooldown active", {
           sessionID,
-          attempt: state.resumeAttempts,
-          backoffMs,
+          cooldownRemaining: state.cooldownEndTime - Date.now(),
         })
-        await new Promise(resolve => setTimeout(resolve, backoffMs))
-      }
-
-      // 1. Abort the current retry loop
-      await logger.info("Aborting session for disconnect recovery", { sessionID })
-      await context.client.session.abort({ path: { id: sessionID } })
-      await new Promise(resolve => setTimeout(resolve, 200))
-
-      // 2. Fetch messages to find partial assistant response
-      await logger.info("Fetching messages for partial content capture", { sessionID })
-      const messagesResponse = await context.client.session.messages({ path: { id: sessionID } })
-      const messages = messagesResponse.data as MessageWithParts[] | undefined
-
-      if (!messages || messages.length === 0) {
-        await logger.error("No messages found in session", { sessionID })
         return
       }
 
-      // 3. Find the last assistant message (the interrupted one) and last user message
-      const reversedMessages = [...messages].reverse()
-      const lastAssistantMessage = reversedMessages.find(m => m.info.role === "assistant")
-      const lastUserMessage = reversedMessages.find(m => m.info.role === "user")
-
-      if (!lastUserMessage) {
-        await logger.error("No user message found in session", { sessionID })
-        return
-      }
-
-      // 4. Extract partial content from the interrupted assistant response
-      const partialContent = lastAssistantMessage ? extractPartialContent(lastAssistantMessage) : null
-
-      // 5. Capture the original model that was responding
-      if (lastAssistantMessage?.info.model && !state.originalModel) {
-        state.originalModel = {
-          providerID: lastAssistantMessage.info.model.providerID,
-          modelID: lastAssistantMessage.info.model.modelID,
-        }
-      }
-
-      await logger.info("Partial content captured", {
+      await logger.info("Rate limit detected, switching to fallback model", {
         sessionID,
-        hasPartialContent: !!partialContent,
-        partialContentLength: partialContent?.length ?? 0,
-        originalModel: state.originalModel,
+        message: truncate(retryMessage),
+        fallbackModel: config.fallbackModel,
       })
 
-      // 6. Revert to the last user message (removes the incomplete assistant response)
-      await logger.info("Reverting session for disconnect recovery", {
-        sessionID,
-        messageId: lastUserMessage.info.id,
-      })
-      await context.client.session.revert({
-        path: { id: sessionID },
-        body: { messageID: lastUserMessage.info.id },
-      })
-      await new Promise(resolve => setTimeout(resolve, 500))
+      state.fallbackActive = true
+      state.cooldownEndTime = Date.now() + config.cooldownMs
+      state.pluginAbortedAt = Date.now()
 
-      // 7. Determine which model to use
-      // First attempt: try the same model (it was a disconnect, not a model issue)
-      // Subsequent attempts: escalate to fallback model
-      let modelToUse: FallbackModelObject
-      if (config.resumeWithSameModel && state.originalModel && state.resumeAttempts <= 1) {
-        modelToUse = state.originalModel
-        await logger.info("Retrying with same model", { sessionID, model: modelToUse })
-      } else {
-        modelToUse = fallbackModel
-        await logger.info("Escalating to fallback model", { sessionID, model: modelToUse })
-      }
-
-      // 8. Build the prompt parts
-      let promptParts: Array<{ type: "text"; text: string } | { type: "file"; mime: string; filename?: string; url: string } | { type: "agent"; name: string }>
-
-      if (partialContent) {
-        // We have partial content: send a continuation prompt
-        const continuationText = buildContinuationPrompt(config.continuationPromptTemplate, partialContent, config.maxPartialContentLength)
-        promptParts = [{ type: "text", text: continuationText }]
-
-        await logger.info("Sending continuation prompt with partial content", {
-          sessionID,
-          model: modelToUse,
-          partialContentLength: partialContent.length,
+      try {
+        await ctx.session.interrupt({ sessionID, resume: false }).catch((err: unknown) => {
+          // The failed run is usually already settled, which is not an error.
+          return logger.info("Interrupt returned an error, continuing", {
+            sessionID,
+            error: err instanceof Error ? err.message : String(err),
+          })
         })
-      } else {
-        // No partial content captured: fall back to re-sending the original user message
-        promptParts = lastUserMessage.parts
-          .filter(p => !isSyntheticPart(p))
-          .map(p => convertToPromptPart(p))
-          .filter((p): p is NonNullable<typeof p> => p !== null)
+        await sleep(INTERRUPT_SETTLE_MS)
 
-        if (promptParts.length === 0) {
-          await logger.error("No valid parts to re-send", { sessionID })
+        const messages = await ctx.session.context({ sessionID })
+        if (!messages || messages.length === 0) {
+          await logger.error("No messages found in session", { sessionID })
           return
         }
 
-        await logger.info("No partial content, re-sending original user message", {
-          sessionID,
-          model: modelToUse,
-          partsCount: promptParts.length,
-        })
-      }
-
-      // 9. Send the prompt
-      await context.client.session.prompt({
-        path: { id: sessionID },
-        body: {
-          model: modelToUse,
-          agent: lastUserMessage.info.agent,
-          parts: promptParts,
-        },
-      })
-
-      await logger.info("Disconnect recovery prompt sent successfully", {
-        sessionID,
-        attempt: state.resumeAttempts,
-        usedContinuation: !!partialContent,
-        model: modelToUse,
-      })
-    } catch (err) {
-      await logger.error("Failed to send disconnect recovery prompt", {
-        sessionID,
-        error: err instanceof Error ? err.message : String(err),
-        attempt: state.resumeAttempts,
-      })
-    } finally {
-      state.resumeActive = false
-    }
-  }
-
-  // ── Event Handler ────────────────────────────────────────────────────────
-
-  // Loop phrase matchers (case-insensitive)
-  const loopStartLower = config.loopStartPhrase.toLowerCase()
-  const loopStopLower = config.loopStopPhrase.toLowerCase()
-
-  /**
-   * Check the last user message in a session for loop control phrases.
-   * Returns "start" if the start phrase is found, "stop" if the stop phrase is
-   * found, or null if neither is found. Stop takes priority over start.
-   */
-  async function checkLoopPhrase(sessionID: string): Promise<"start" | "stop" | null> {
-    if (!config.loopEnabled) return null
-
-    try {
-      const messagesResponse = await context.client.session.messages({ path: { id: sessionID } })
-      const messages = messagesResponse.data as MessageWithParts[] | undefined
-      if (!messages || messages.length === 0) return null
-
-      const lastUserMessage = [...messages].reverse().find(m => m.info.role === "user")
-      if (!lastUserMessage) return null
-
-      const text = lastUserMessage.parts
-        .filter(p => p.type === "text" && p.text)
-        .map(p => p.text!)
-        .join("")
-        .toLowerCase()
-
-      // Stop takes priority: if user says both (unlikely), stop wins
-      if (text.includes(loopStopLower)) return "stop"
-      if (text.includes(loopStartLower)) return "start"
-      return null
-    } catch {
-      return null
-    }
-  }
-
-  return {
-    event: async ({ event }) => {
-      if (event.type === "session.status") {
-        const props = event.properties as {
-          sessionID: string
-          status: {
-            type: "idle" | "retry" | "busy"
-            attempt?: number
-            message?: string
-            next?: number
-          }
+        const lastUserMessage = [...messages].reverse().find(isUserMessage)
+        if (!lastUserMessage) {
+          await logger.error("No user message found in session", { sessionID })
+          return
         }
 
-        if (props.status.type === "retry" && props.status.message) {
-          const sessionID = props.sessionID
-          const state = getSessionState(sessionID)
+        // V2 prompts do not accept a model, so the session model is switched
+        // first. Unlike V1 (which scoped the fallback model to a single
+        // re-sent message) the session then stays on the fallback model until
+        // it is switched back manually or a new session is created.
+        await ctx.session.switchModel({
+          sessionID,
+          model: { providerID: fallbackModel.providerID, id: fallbackModel.modelID },
+        })
 
-          // If the plugin recently initiated an abort, ignore retry events
-          // that were likely queued before our abort took effect.
-          // We use a 5-second grace window: any retry event arriving within
-          // 5 seconds of our abort is assumed to be stale.
-          const ABORT_GRACE_MS = 5000
-          if (state.pluginAbortedAt > 0 && Date.now() - state.pluginAbortedAt < ABORT_GRACE_MS) {
-            await logger.info("Ignoring retry event within abort grace window", {
-              sessionID,
-              abortedAt: state.pluginAbortedAt,
-              elapsed: Date.now() - state.pluginAbortedAt,
-            })
-            return
-          }
+        await ctx.session.prompt({ sessionID, ...toPromptPayload(lastUserMessage) })
 
-          const message = props.status.message
+        await logger.info("Rate-limit fallback prompt sent successfully", {
+          sessionID,
+          model: fallbackModel,
+          messageId: lastUserMessage.id,
+          totalMessages: messages.length,
+        })
+      } catch (err) {
+        await logger.error("Failed to send rate-limit fallback prompt", {
+          sessionID,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        // Restore the ability to retry on the next failure.
+        state.fallbackActive = false
+        state.cooldownEndTime = 0
+      }
+    }
 
-          // Check disconnect patterns first (more specific recovery)
-          if (isDisconnectMessage(message)) {
-            await handleDisconnectRecovery(sessionID, message)
-            return
-          }
+    // ── Disconnect Resume Recovery ─────────────────────────────────────────
+    // Capture partial assistant response, then send a continuation prompt that
+    // includes the partial content so the model picks up where it left off.
 
-          // Then check rate limit patterns
-          if (isRateLimitMessage(message)) {
-            await handleRateLimitRecovery(sessionID, message)
-            return
-          }
+    async function handleDisconnectRecovery(sessionID: string, retryMessage: string) {
+      const state = getSessionState(sessionID)
 
-          // Unknown retry reason -- log but don't act
-          await logger.info("Retry detected but no matching pattern", {
+      // Guard: max resume attempts
+      if (state.resumeAttempts >= config.maxResumeAttempts) {
+        await logger.warn("Max resume attempts reached, giving up", {
+          sessionID,
+          attempts: state.resumeAttempts,
+          maxAttempts: config.maxResumeAttempts,
+        })
+        return
+      }
+
+      // Guard: if we're already actively resuming, don't stack
+      if (state.resumeActive) {
+        await logger.info("Resume already in progress, skipping", { sessionID })
+        return
+      }
+
+      await logger.info("Disconnect detected, attempting to resume", {
+        sessionID,
+        message: truncate(retryMessage),
+        attempt: state.resumeAttempts + 1,
+        maxAttempts: config.maxResumeAttempts,
+      })
+
+      state.resumeActive = true
+      state.resumeAttempts += 1
+      state.pluginAbortedAt = Date.now()
+
+      try {
+        // Exponential backoff: 2s, 4s, 8s for attempts 1, 2, 3
+        const backoffMs = Math.min(2000 * Math.pow(2, state.resumeAttempts - 1), 30000)
+        if (state.resumeAttempts > 1) {
+          await logger.info("Applying exponential backoff before retry", {
             sessionID,
-            message,
+            attempt: state.resumeAttempts,
+            backoffMs,
+          })
+          await sleep(backoffMs)
+        }
+
+        // 1. Interrupt the current retry loop
+        await ctx.session.interrupt({ sessionID, resume: false }).catch((err: unknown) => {
+          return logger.info("Interrupt returned an error, continuing", {
+            sessionID,
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
+        await sleep(INTERRUPT_SETTLE_MS)
+
+        // 2. Fetch messages to find partial assistant response
+        const messages = await ctx.session.context({ sessionID })
+        if (!messages || messages.length === 0) {
+          await logger.error("No messages found in session", { sessionID })
+          return
+        }
+
+        // 3. Find the last assistant message (the interrupted one) and last user message
+        const reversedMessages = [...messages].reverse()
+        const lastAssistantMessage = reversedMessages.find(isAssistantMessage)
+        const lastUserMessage = reversedMessages.find(isUserMessage)
+
+        if (!lastUserMessage) {
+          await logger.error("No user message found in session", { sessionID })
+          return
+        }
+
+        // 4. Extract partial content from the interrupted assistant response
+        const partialContent = lastAssistantMessage ? extractPartialContent(lastAssistantMessage) : null
+
+        // 5. Capture the original model that was responding
+        if (lastAssistantMessage?.model && !state.originalModel) {
+          state.originalModel = lastAssistantMessage.model
+        }
+
+        await logger.info("Partial content captured", {
+          sessionID,
+          hasPartialContent: !!partialContent,
+          partialContentLength: partialContent?.length ?? 0,
+          originalModel: state.originalModel
+            ? String(state.originalModel.providerID) + "/" + String(state.originalModel.id)
+            : null,
+        })
+
+        // NOTE: V1 reverted the session to the last user message here, which
+        // removed the incomplete assistant response. The V2 plugin API does not
+        // expose revert, so the interrupted message stays in the transcript and
+        // the continuation prompt is appended after it.
+
+        // 6. Determine which model to use.
+        // First attempt: try the same model (it was a disconnect, not a model
+        // issue). Subsequent attempts: escalate to fallback model.
+        let modelToUse: ModelRef
+        if (config.resumeWithSameModel && state.originalModel && state.resumeAttempts <= 1) {
+          modelToUse = state.originalModel
+          await logger.info("Retrying with same model", {
+            sessionID,
+            model: String(modelToUse.providerID) + "/" + String(modelToUse.id),
+          })
+        } else {
+          modelToUse = { providerID: fallbackModel.providerID, id: fallbackModel.modelID }
+          await logger.info("Escalating to fallback model", {
+            sessionID,
+            model: String(modelToUse.providerID) + "/" + String(modelToUse.id),
           })
         }
 
-        if (props.status.type === "idle") {
-          const sessionID = props.sessionID
-          const state = sessionStates.get(sessionID) ?? getSessionState(sessionID)
+        await ctx.session.switchModel({ sessionID, model: modelToUse })
 
-          // Reset rate-limit cooldown if expired
-          if (state.fallbackActive && Date.now() >= state.cooldownEndTime) {
-            state.fallbackActive = false
-            await logger.info("Rate-limit cooldown expired, fallback reset", { sessionID })
+        // 7. Build and send the prompt
+        if (partialContent) {
+          // We have partial content: send a continuation prompt
+          const continuationText = buildContinuationPrompt(
+            config.continuationPromptTemplate,
+            partialContent,
+            config.maxPartialContentLength
+          )
+
+          await logger.info("Sending continuation prompt with partial content", {
+            sessionID,
+            partialContentLength: partialContent.length,
+          })
+
+          await ctx.session.prompt({ sessionID, text: continuationText })
+        } else {
+          // No partial content captured: fall back to re-sending the original
+          // user message
+          const promptPayload = toPromptPayload(lastUserMessage)
+          if (!promptPayload.text && !promptPayload.files?.length) {
+            await logger.error("No valid parts to re-send", { sessionID })
+            return
           }
 
-          // Reset disconnect resume state on successful completion
-          if (state.resumeAttempts > 0 && !state.resumeActive) {
-            await logger.info("Session idle after disconnect recovery, resetting resume state", {
-              sessionID,
-              totalAttempts: state.resumeAttempts,
-            })
-            state.resumeAttempts = 0
-            state.originalModel = null
-            state.pluginAbortedAt = 0
-          }
+          await logger.info("No partial content, re-sending original user message", {
+            sessionID,
+          })
 
-          // Ralph loop: check for control phrases and auto-continue
-          if (config.loopEnabled) {
-            const loopAction = await checkLoopPhrase(sessionID)
-
-            if (loopAction === "start") {
-              state.loopActive = true
-              await logger.info("Ralph loop activated for session", { sessionID })
-              // Don't loop on the activation message itself -- wait for next idle
-              return
-            }
-
-            if (loopAction === "stop") {
-              state.loopActive = false
-              await logger.info("Ralph loop deactivated for session", { sessionID })
-              return
-            }
-
-            // If loop is active and no control phrase was found, send the loop prompt
-            if (state.loopActive) {
-              await logger.info("Ralph loop firing, sending continuation prompt", { sessionID })
-              try {
-                await context.client.session.prompt({
-                  path: { id: sessionID },
-                  body: {
-                    parts: [{ type: "text", text: config.loopPrompt }],
-                  },
-                })
-                await logger.info("Ralph loop prompt sent successfully", { sessionID })
-              } catch (err) {
-                await logger.error("Failed to send Ralph loop prompt", {
-                  sessionID,
-                  error: err instanceof Error ? err.message : String(err),
-                })
-              }
-            }
-          }
+          await ctx.session.prompt({ sessionID, ...promptPayload })
         }
+
+        await logger.info("Disconnect recovery prompt sent successfully", {
+          sessionID,
+          attempt: state.resumeAttempts,
+          usedContinuation: !!partialContent,
+        })
+      } catch (err) {
+        await logger.error("Failed to send disconnect recovery prompt", {
+          sessionID,
+          error: err instanceof Error ? err.message : String(err),
+          attempt: state.resumeAttempts,
+        })
+      } finally {
+        state.resumeActive = false
+      }
+    }
+
+    // ── Recovery scheduling ────────────────────────────────────────────────
+
+    function scheduleRecovery(kind: RetryKind, sessionID: string, message: string) {
+      setTimeout(() => {
+        void (async () => {
+          try {
+            if (!(await isOwnSession(sessionID))) {
+              await logger.info("Skipping recovery owned by another location", { sessionID, kind })
+              return
+            }
+            if (kind === "rate-limit") {
+              await handleRateLimitRecovery(sessionID, message)
+            } else {
+              await handleDisconnectRecovery(sessionID, message)
+            }
+          } catch (err) {
+            await logger.error("Recovery failed", {
+              sessionID,
+              kind,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        })()
+      }, RECOVERY_DELAY_MS)
+    }
+
+    // ── Retry hook (rate limit / disconnect detection) ─────────────────────
+    // OpenCode V2 publishes no `session.status` events to plugins, so
+    // detection moved from the event stream to the retry hook, which also
+    // carries a structured provider error.
+
+    const retryRegistration = await ctx.session.hook("retry", (event) => {
+      const error = event.error
+      const haystack = truncate(
+        [error.type, error.message, error.status ? String(error.status) : "", error.response?.body ?? ""]
+          .filter(Boolean)
+          .join(" "),
+        MAX_ERROR_TEXT
+      )
+      const state = getSessionState(event.sessionID)
+      const now = Date.now()
+
+      if (state.pluginAbortedAt > 0 && now - state.pluginAbortedAt < ABORT_GRACE_MS) {
+        void logger.info("Ignoring retry event inside abort grace window", {
+          sessionID: event.sessionID,
+          attempt: event.attempt,
+          elapsed: now - state.pluginAbortedAt,
+        })
+        return
+      }
+
+      // Check disconnect patterns first (more specific recovery)
+      if (isDisconnectMessage(haystack)) {
+        if (state.resumeActive) {
+          void logger.info("Resume already in progress, leaving retry policy untouched", {
+            sessionID: event.sessionID,
+          })
+          return
+        }
+        if (state.resumeAttempts >= config.maxResumeAttempts) {
+          void logger.warn("Max resume attempts reached, leaving retry policy untouched", {
+            sessionID: event.sessionID,
+            attempts: state.resumeAttempts,
+          })
+          return
+        }
+
+        state.pluginAbortedAt = now
+        void logger.info("Disconnect detected in retry hook", {
+          sessionID: event.sessionID,
+          attempt: event.attempt,
+          message: truncate(haystack),
+        })
+        event.decision = { retry: false }
+        scheduleRecovery("disconnect", event.sessionID, haystack)
+        return
+      }
+
+      // Then check rate limit patterns
+      if (isRateLimitMessage(haystack)) {
+        if (state.fallbackActive && now < state.cooldownEndTime) {
+          void logger.info("Rate-limit cooldown active, leaving retry policy untouched", {
+            sessionID: event.sessionID,
+            cooldownRemaining: state.cooldownEndTime - now,
+          })
+          return
+        }
+
+        state.pluginAbortedAt = now
+        void logger.info("Rate limit detected in retry hook", {
+          sessionID: event.sessionID,
+          attempt: event.attempt,
+          message: truncate(haystack),
+        })
+        event.decision = { retry: false }
+        scheduleRecovery("rate-limit", event.sessionID, haystack)
+        return
+      }
+
+      // Unknown retry reason -- log but don't act, OpenCode keeps its policy.
+      void logger.info("Retry detected but no matching pattern", {
+        sessionID: event.sessionID,
+        attempt: event.attempt,
+        message: truncate(haystack),
+      })
+    })
+
+    // ── Ralph loop ─────────────────────────────────────────────────────────
+
+    const loopStartLower = config.loopStartPhrase.toLowerCase()
+    const loopStopLower = config.loopStopPhrase.toLowerCase()
+
+    /**
+     * Check the last user message in a session for loop control phrases.
+     * Returns "start" if the start phrase is found, "stop" if the stop phrase is
+     * found, or null if neither is found. Stop takes priority over start.
+     */
+    async function checkLoopPhrase(sessionID: string): Promise<"start" | "stop" | null> {
+      if (!config.loopEnabled) return null
+
+      try {
+        const messages = await ctx.session.context({ sessionID })
+        if (!messages || messages.length === 0) return null
+
+        const lastUserMessage = [...messages].reverse().find(isUserMessage)
+        if (!lastUserMessage) return null
+
+        const text = lastUserMessage.text.toLowerCase()
+
+        await logger.info("Last user message text for loop check", {
+          sessionID,
+          text: truncate(text, 100),
+        })
+
+        // Stop takes priority: if user says both (unlikely), stop wins
+        if (text.includes(loopStopLower)) return "stop"
+        if (text.includes(loopStartLower)) return "start"
+        return null
+      } catch (err) {
+        await logger.error("Error in checkLoopPhrase", {
+          sessionID,
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return null
+      }
+    }
+
+    /**
+     * A turn finished. Reset recovered state and drive the Ralph loop.
+     * Only successful completions count: a failed turn must not restart the
+     * loop, otherwise a broken provider would spin the loop forever.
+     */
+    async function handleTurnCompleted(sessionID: string) {
+      const state = getSessionState(sessionID)
+
+      // Reset rate-limit cooldown if expired
+      if (state.fallbackActive && Date.now() >= state.cooldownEndTime) {
+        state.fallbackActive = false
+        await logger.info("Rate-limit cooldown expired, fallback reset", { sessionID })
+      }
+
+      // Reset disconnect resume state on successful completion
+      if (state.resumeAttempts > 0 && !state.resumeActive) {
+        await logger.info("Session completed after disconnect recovery, resetting resume state", {
+          sessionID,
+          totalAttempts: state.resumeAttempts,
+        })
+        state.resumeAttempts = 0
+        state.originalModel = null
+        state.pluginAbortedAt = 0
+      }
+
+      if (!config.loopEnabled) return
+
+      const loopAction = await checkLoopPhrase(sessionID)
+
+      if (loopAction === "start") {
+        state.loopActive = true
+        await logger.info("Ralph loop activated for session", { sessionID })
+        // Don't loop on the activation message itself -- wait for the next
+        // completed turn
+        return
+      }
+
+      if (loopAction === "stop") {
+        state.loopActive = false
+        await logger.info("Ralph loop deactivated for session", { sessionID })
+        return
+      }
+
+      if (!state.loopActive) return
+
+      try {
+        await ctx.session.prompt({ sessionID, text: config.loopPrompt })
+        await logger.info("Ralph loop prompt sent successfully", { sessionID })
+      } catch (err) {
+        await logger.error("Failed to send Ralph loop prompt", {
+          sessionID,
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+
+    // ── Event handler ──────────────────────────────────────────────────────
+
+    async function handleEvent(event: PluginEvent) {
+      // V2 sends no `session.status` events to plugins: "session idle" is
+      // derived from execution lifecycle events instead.
+      if (event.type === "session.execution.succeeded") {
+        if (!(await isOwnSession(event.data.sessionID))) return
+        await handleTurnCompleted(event.data.sessionID)
+        return
       }
 
       if (event.type === "session.deleted") {
-        const props = event.properties as { info?: { id?: string } }
-        if (props.info?.id) {
-          sessionStates.delete(props.info.id)
-          await logger.info("Session cleaned up", { sessionID: props.info.id })
+        sessionStates.delete(event.data.sessionID)
+        await logger.info("Session cleaned up", { sessionID: event.data.sessionID })
+      }
+    }
+
+    const controller = new AbortController()
+
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          try {
+            await handleEvent(event)
+          } catch (err) {
+            await logger.error("Failed to handle event", {
+              type: event.type,
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
         }
+      } catch (err) {
+        // Aborting the subscription during shutdown is expected.
+        if (controller.signal.aborted) return
+        await logger.error("Event subscription stopped", {
+          error: err instanceof Error ? err.message : String(err),
+        })
       }
-    },
-  }
-}
+    })()
 
-// ── Utility Functions ────────────────────────────────────────────────────────
+    await logger.info("Plugin ready", {
+      location: String(ctx.location.directory),
+    })
 
-function isSyntheticPart(part: MessagePart): boolean {
-  return (part as any).synthetic === true
-}
-
-function convertToPromptPart(part: MessagePart): { type: "text"; text: string } | { type: "file"; mime: string; filename?: string; url: string } | { type: "agent"; name: string } | null {
-  switch (part.type) {
-    case "text":
-      if (part.text) {
-        return { type: "text", text: part.text }
-      }
-      return null
-    case "file":
-      if (part.url && part.mime) {
-        return { type: "file", mime: part.mime, filename: part.filename, url: part.url }
-      }
-      return null
-    case "agent":
-      if (part.name) {
-        return { type: "agent", name: part.name }
-      }
-      return null
-    default:
-      return null
-  }
-}
+    return async () => {
+      controller.abort()
+      await retryRegistration.dispose()
+    }
+  },
+})

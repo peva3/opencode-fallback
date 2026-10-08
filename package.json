@@ -1,7 +1,7 @@
 {
 	"name": "opencode-fallback",
-	"version": "1.0.0",
-	"description": "OpenCode plugin that recovers from provider disconnects (resuming mid-response) and rate limits (switching to fallback model)",
+	"version": "2.0.0",
+	"description": "OpenCode 2 plugin that recovers from provider disconnects (resuming mid-response) and rate limits (switching to fallback model)",
 	"type": "module",
 	"main": "index.ts",
 	"files": [
@@ -13,6 +13,7 @@
 	},
 	"keywords": [
 		"opencode",
+		"opencode-2",
 		"fallback",
 		"disconnect",
 		"resume",
@@ -28,10 +29,10 @@
 		"url": "https://github.com/peva3/opencode-fallback.git"
 	},
 	"peerDependencies": {
-		"@opencode-ai/plugin": ">=1.0.0"
+		"@opencode/plugin": ">=2.0.0"
 	},
 	"devDependencies": {
-		"@opencode-ai/plugin": "^1.0.0",
+		"@opencode/plugin": "^2.0.25",
 		"@types/node": "^22.0.0",
 		"typescript": "^5.0.0"
 	}
